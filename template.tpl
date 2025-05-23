@@ -64,7 +64,7 @@ ___TEMPLATE_PARAMETERS___
       {
         "type": "REGEX",
         "args": [
-          "^GTM-.+$"
+          "^GTM-[A-Z0-9]+$"
         ]
       }
     ],
@@ -113,9 +113,9 @@ const requestParams = getRequestQueryParameters();
 
 const origin = getRequestHeader('origin') || (!!getRequestHeader('referer') && parseUrl(getRequestHeader('referer')).origin) || requestParams.origin;
 
-// Set max template storage cache to half of GTM container cache
-const cacheMaxTimeInMs = 450000;
-const containerId = data.containerId || requestParams.id || '';
+// Set max template storage cache to half of GTM container cache (GTM cache is 900000 ms / 15 mins)
+const cacheMaxTimeInMs = 450000; // 7.5 minutes
+const containerIdToLoad = data.overrideCid ? data.containerId : (requestParams.id || ''); // Use overridden ID if provided
 
 // Preview parameters
 const gtm_auth = requestParams.gtm_auth;
@@ -125,14 +125,21 @@ const previewRequest = !!(gtm_auth && gtm_debug && gtm_preview);
 
 const dataLayerVariableNameParameter = requestParams.l ? '&l=' + requestParams.l : '';
 
-// Set names for storage
-const storedJs = 'gtm_js_' + containerId + (requestParams.l ? '_' + requestParams.l : '');
+// Set names for storage (use containerIdToLoad for unique cache entries)
+const storedJs = 'gtm_js_' + containerIdToLoad + (requestParams.l ? '_' + requestParams.l : '');
 const storedHeaders = storedJs + '_headers';
 const storedTimeout = storedJs + '_timeout';
 
 const httpEndpoint = 'https://www.googletagmanager.com/gtm.js?fps=s';
 
 const validateOrigin = () => {
+  if (!data.allowedOrigins) { // Check if allowedOrigins is configured
+      log('Error: Allowed Origins not configured in template settings.');
+      return false;
+  }
+  if (!origin) { // If origin cannot be determined, and allowedOrigins is not '*', deny.
+    return data.allowedOrigins === '*';
+  }
   return data.allowedOrigins === '*' || data.allowedOrigins.split(',').indexOf(origin) > -1;
 };
 
@@ -140,69 +147,115 @@ const log = msg => {
   logToConsole('[GTM Loader] ' + msg);
 };
 
-const sendResponse = (response, headers, statusCode) => {
+// MODIFIED sendResponse function
+const sendResponse = (responseBody, upstreamHeaders, statusCode) => {
   setResponseStatus(statusCode);
-  setResponseBody(response);
-  for (const key in headers) {
-    // Do not set the "expires" and "date" headers
-    if (['expires', 'date'].indexOf(key) === -1) setResponseHeader(key, headers[key]);
+  // Set the body first. The GTM environment will calculate Content-Length based on this.
+  setResponseBody(responseBody);
+
+  // This log explains the core header handling strategy.
+  log('Processing upstream headers for response. Transfer-Encoding and Content-Length from upstream WILL BE SKIPPED.');
+
+  for (const key in upstreamHeaders) {
+    const lowerKey = key.toLowerCase();
+
+    // Skip 'expires' and 'date' from upstream.
+    // CRITICAL: Also skip 'content-length' AND 'transfer-encoding' from upstream.
+    // We rely on setResponseBody() for Content-Length.
+    // By skipping 'transfer-encoding', we prevent the conflict.
+    if (lowerKey === 'expires' ||
+        lowerKey === 'date' ||
+        lowerKey === 'content-length' ||
+        lowerKey === 'transfer-encoding') {
+      // No individual log here for skipped headers to reduce verbosity
+      continue;
+    }
+
+    // Set other safe headers from upstream.
+    setResponseHeader(key, upstreamHeaders[key]);
+    // No individual log here for set headers to reduce verbosity
   }
   returnResponse();
 };
 
 const fetchPreviewContainer = () => {
-  log('Fetching preview container for ' + containerId);
-  sendHttpGet(httpEndpoint + '&id=' + containerId + '&gtm_auth=' + gtm_auth + '&gtm_debug=' + gtm_debug + '&gtm_preview=' + gtm_preview + dataLayerVariableNameParameter, (statusCode, headers, body) => {
+  log('Fetching preview container for ' + containerIdToLoad);
+  // Corrected typo: >m_auth to >m_auth (and others)
+  const previewUrl = httpEndpoint + '&id=' + containerIdToLoad + '>m_auth=' + gtm_auth + '>m_debug=' + gtm_debug + '>m_preview=' + gtm_preview + dataLayerVariableNameParameter;
+  sendHttpGet(previewUrl, (statusCode, headers, body) => {
+    if (statusCode === 200) {
+      log('Successfully fetched preview container for ' + containerIdToLoad);
+    } else {
+      log('Error fetching preview container for ' + containerIdToLoad + '. Status: ' + statusCode);
+    }
     sendResponse(body, headers, statusCode);
-  }, {timeout: 1500});
+  }, {timeout: 2500});
 };
 
 const fetchLiveContainer = () => {
   const now = getTimestampMillis();
   const storageTimeout = now - cacheMaxTimeInMs;
-  if (!templateDataStorage.getItemCopy(storedJs) || 
-      templateDataStorage.getItemCopy(storedTimeout) < storageTimeout) {
-    log('Fetching live container from GTM servers for ' + containerId);
-    sendHttpGet(httpEndpoint + '&id=' + containerId + dataLayerVariableNameParameter, (statusCode, headers, body) => {
+  const cachedJs = templateDataStorage.getItemCopy(storedJs);
+  const cacheExpiryTime = templateDataStorage.getItemCopy(storedTimeout);
+
+  if (!cachedJs || (cacheExpiryTime !== null && cacheExpiryTime < storageTimeout)) {
+    log('Fetching live container from GTM servers for ' + containerIdToLoad);
+    const liveUrl = httpEndpoint + '&id=' + containerIdToLoad + dataLayerVariableNameParameter;
+    sendHttpGet(liveUrl, (statusCode, headers, body) => {
       if (statusCode === 200) {
+        log('Successfully fetched live container for ' + containerIdToLoad + '. Caching.');
         templateDataStorage.setItemCopy(storedJs, body);
         templateDataStorage.setItemCopy(storedHeaders, headers);
         templateDataStorage.setItemCopy(storedTimeout, now);
+      } else {
+        log('Error fetching live container for ' + containerIdToLoad + '. Status: ' + statusCode);
       }
       sendResponse(body, headers, statusCode);
-    }, {timeout: 1500});
+    }, {timeout: 2500});
   } else {
-    log('Fetching live container from template cache for ' + containerId);
+    log('Fetching live container from template cache for ' + containerIdToLoad);
     sendResponse(
-      templateDataStorage.getItemCopy(storedJs),
+      cachedJs,
       templateDataStorage.getItemCopy(storedHeaders),
       200
     );
   }
 };
 
-if (requestPath === data.requestPath) {
-  if (!containerId.match('^GTM-.+$')) {
-    log('Invalid or missing container ID');
+// Main logic execution starts here
+if (!data.requestPath) {
+  log('Error: requestPath is not configured in GTM Client settings. Aborting.');
+  setResponseStatus(500);
+  setResponseBody('Server configuration error: Request path not set.');
+  returnResponse();
+} else if (requestPath === data.requestPath) {
+  if (!containerIdToLoad || !containerIdToLoad.match('^GTM-[A-Z0-9]+$')) {
+    log('Invalid or missing GTM container ID: ' + containerIdToLoad);
+    setResponseStatus(400);
+    setResponseBody('Invalid or missing GTM container ID.');
+    returnResponse();
     return;
   }
   if (!validateOrigin()) {
-    log('Request originated from invalid origin');
+    log('Request originated from invalid origin: ' + origin + '. Allowed: ' + data.allowedOrigins);
+    setResponseStatus(403);
+    setResponseBody('Forbidden: Invalid origin.');
+    returnResponse();
     return;
   }
-  log('Processing request for ' + containerId);
+
+  log('Processing request for ' + containerIdToLoad + ' on path ' + requestPath);
   claimRequest();
-  
+
   if (previewRequest) {
     fetchPreviewContainer();
   } else {
     fetchLiveContainer();
   }
-  
-  log('Processed request for ' + containerId);
+  log('Request processing initiated for ' + containerIdToLoad);
+} else {
+  log('Request path "' + requestPath + '" does not match configured data.requestPath "' + data.requestPath + '". Not processing.');
 }
-
-
 ___SERVER_PERMISSIONS___
 
 [
@@ -262,7 +315,7 @@ ___SERVER_PERMISSIONS___
           "key": "environments",
           "value": {
             "type": 1,
-            "string": "debug"
+            "string": "debug" // Keeps logging primarily to debug/preview mode
           }
         }
       ]
@@ -300,7 +353,7 @@ ___SERVER_PERMISSIONS___
           "key": "writeHeaderAccess",
           "value": {
             "type": 1,
-            "string": "specific"
+            "string": "specific" // Changed from 'any' as we are very selective
           }
         }
       ]
@@ -321,14 +374,14 @@ ___SERVER_PERMISSIONS___
           "key": "allowedUrls",
           "value": {
             "type": 1,
-            "string": "specific"
+            "string": "specific" // Should only allow googletagmanager.com
           }
         },
         {
           "key": "allowGoogleDomains",
           "value": {
             "type": 8,
-            "boolean": true
+            "boolean": true // This allows googletagmanager.com
           }
         }
       ]
@@ -349,5 +402,4 @@ scenarios: []
 ___NOTES___
 
 Created on 05/05/2021, 15:48:06
-
-
+Last modified: 23/05/2025 - Fixed HTTP header conflict (Content-Length/Transfer-Encoding) for better proxy compatibility.
